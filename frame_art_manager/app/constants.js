@@ -91,6 +91,12 @@ function getMattesForOrientation(isPortrait) {
   return isPortrait ? PORTRAIT_MATTE_TYPES : MATTE_TYPES;
 }
 
+// NOTE: Photo filters require Samsung Art API v1.0+.
+// TVs running the legacy v0.97 API (including some 2018–2023 Frame models that
+// report version 0.97) will silently reject set_photo_filter with error -9.
+// The integration logs a one-time warning and skips filter calls for those TVs.
+// Setting a filter value here is safe — it will be stored in metadata but
+// simply not applied if the TV does not support it.
 const FILTER_TYPES = [
   'None',
   'Aqua',
