@@ -13774,7 +13774,7 @@ function initTagsetModalListeners() {
   async function runSearch(q) {
     setStatus('Searching…');
     try {
-      const url = `/api/ha/search?q=${encodeURIComponent(q)}&top_k=64`;
+      const url = `${API_BASE}/ha/search?q=${encodeURIComponent(q)}&top_k=64`;
       const r = await fetch(url);
       const data = await r.json();
       if (!r.ok || data.error) {
@@ -13795,7 +13795,7 @@ function initTagsetModalListeners() {
     }
     setStatus('Discovering…');
     try {
-      const r = await fetch('/api/ha/discover', {
+      const r = await fetch(`${API_BASE}/ha/discover`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
