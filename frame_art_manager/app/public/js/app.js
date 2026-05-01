@@ -3339,7 +3339,14 @@ function renderGallery(filter = '') {
     console.warn('Gallery render skipped: image grid element not found.');
     return;
   }
-  
+
+  // Semantic-mode guard: when Qdrant results are showing, skip the substring
+  // re-render. Defined and managed by the semantic-search IIFE at the bottom
+  // of this file via window.__semanticSearch.
+  if (window.__semanticSearch?.state?.activeResults) {
+    return;
+  }
+
   // Update similar threshold bar visibility
   updateSimilarThresholdBar();
 
@@ -13508,4 +13515,486 @@ function initTagsetModalListeners() {
   // "New Tagset" button in Tags tab - needs to open modal with no device pre-selected
   // We'll handle this differently - through the individual TV sections
 }
+
+/* ==========================================================================
+   Semantic search & Qdrant Discovery (ported from frame_art_shuffler dashboard)
+   --------------------------------------------------------------------------
+   - Toggle (✨) next to the search input enables semantic mode.
+   - In semantic mode: pressing Enter runs /api/ha/search (text → Qdrant).
+   - When the user 👍/👎 cards (or right-clicks for negative), the next Enter
+     runs /api/ha/discover with text-as-target (or first-positive as target).
+   - Toggle off restores the normal substring filter immediately.
+   - All state lives in this section; no edits to renderGallery() required.
+   ========================================================================== */
+(function semanticSearch() {
+  const SemState = {
+    enabled: false,
+    positives: [],
+    negatives: [],
+    activeResults: null,    // null = no semantic results showing; array = ranked filenames
+    scoresByFilename: new Map(),
+  };
+
+  // ---- DOM helpers ----------------------------------------------------------
+
+  function qs(sel) { return document.querySelector(sel); }
+  function escHtml(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function setStatus(msg, kind) {
+    const el = qs('#semantic-status');
+    if (!el) return;
+    if (!msg) {
+      el.classList.remove('show', 'error');
+      el.innerHTML = '';
+      return;
+    }
+    el.classList.add('show');
+    el.classList.toggle('error', kind === 'error');
+    el.innerHTML =
+      `<span>${escHtml(msg)}</span>` +
+      (SemState.activeResults
+        ? '<button type="button" class="clear-link" data-action="clear-results">Show full library</button>'
+        : '');
+  }
+
+  // ---- Context strip --------------------------------------------------------
+
+  function chipImg(fn) {
+    const src = `library/${encodeURIComponent(fn)}`;
+    return `<img src="${escHtml(src)}" alt="">`;
+  }
+
+  function renderContextStrip() {
+    const strip = qs('#semantic-context-strip');
+    if (!strip) return;
+    const q = (qs('#search-input')?.value || '').trim();
+    const hasCtx = SemState.positives.length || SemState.negatives.length;
+
+    if (!SemState.enabled || !hasCtx) {
+      strip.classList.remove('show');
+      strip.innerHTML = '';
+      return;
+    }
+
+    let targetChip = '';
+    let posOffset = 0;
+    if (q) {
+      targetChip = `<span class="semantic-chip target"><span>🎯</span><span class="chip-text">"${escHtml(q)}"</span></span>`;
+    } else if (SemState.positives.length) {
+      const tfn = SemState.positives[0];
+      targetChip = `
+        <span class="semantic-chip target">
+          <span>🎯</span>${chipImg(tfn)}
+          <span class="chip-text">${escHtml(tfn)}</span>
+          <span class="chip-x" data-remove="pos" data-filename="${escHtml(tfn)}">×</span>
+        </span>`;
+      posOffset = 1;
+    }
+
+    const posChips = SemState.positives.slice(posOffset).map(fn => `
+      <span class="semantic-chip positive">
+        👍${chipImg(fn)}
+        <span class="chip-text">${escHtml(fn)}</span>
+        <span class="chip-x" data-remove="pos" data-filename="${escHtml(fn)}">×</span>
+      </span>`).join('');
+
+    const negChips = SemState.negatives.map(fn => `
+      <span class="semantic-chip negative">
+        👎${chipImg(fn)}
+        <span class="chip-text">${escHtml(fn)}</span>
+        <span class="chip-x" data-remove="neg" data-filename="${escHtml(fn)}">×</span>
+      </span>`).join('');
+
+    const validity = validateForSearch(q);
+    strip.innerHTML = `
+      <span class="label">Context (${SemState.positives.length + SemState.negatives.length}):</span>
+      ${targetChip}${posChips}${negChips}
+      <button type="button" class="ctx-clear-btn" data-action="clear-ctx">Clear</button>
+      <button type="button" class="ctx-discover-btn" data-action="run-discover" ${validity.ok ? '' : 'disabled title="' + escHtml(validity.reason) + '"'}>
+        Discover →
+      </button>`;
+    strip.classList.add('show');
+  }
+
+  function validateForSearch(q) {
+    if (q) return { ok: true };
+    if (!SemState.positives.length) return { ok: false, reason: 'Add at least 2 positives, or include a text query' };
+    if (SemState.positives.length < 2) return { ok: false, reason: 'Add at least 2 positives, or include a text query' };
+    if (SemState.positives.length + SemState.negatives.length < 3) return { ok: false, reason: 'Add at least 3 images total' };
+    return { ok: true };
+  }
+
+  // ---- Card decoration ------------------------------------------------------
+
+  function decorateCard(card) {
+    if (!card || card.dataset.semDecorated) return;
+    const fn = card.dataset.filename;
+    if (!fn) return;
+
+    const info = card.querySelector('.image-info');
+    if (info && !info.querySelector('.semantic-vote-row')) {
+      const row = document.createElement('div');
+      row.className = 'semantic-vote-row';
+      row.innerHTML = `
+        <button type="button" class="semantic-vote-btn" data-vote="pos" data-filename="${escHtml(fn)}" title="More like this">👍</button>
+        <button type="button" class="semantic-vote-btn" data-vote="neg" data-filename="${escHtml(fn)}" title="Less like this">👎</button>`;
+      info.appendChild(row);
+    }
+
+    card.dataset.semDecorated = '1';
+    restyleCard(card);
+  }
+
+  function decorateAllCards() {
+    document.querySelectorAll('#image-grid .image-card').forEach(decorateCard);
+  }
+
+  function restyleCard(card) {
+    const fn = card.dataset.filename;
+    const isPos = SemState.positives.includes(fn);
+    const isNeg = SemState.negatives.includes(fn);
+    const isTarget = SemState.activeResults && SemState.positives.length && !((qs('#search-input')?.value || '').trim()) && SemState.positives[0] === fn;
+
+    card.classList.toggle('semantic-positive', isPos);
+    card.classList.toggle('semantic-negative', isNeg);
+    card.classList.toggle('semantic-target', !!isTarget);
+
+    card.querySelectorAll('.semantic-vote-btn').forEach(btn => {
+      const isPosBtn = btn.dataset.vote === 'pos';
+      const active = isPosBtn ? isPos : isNeg;
+      btn.classList.toggle('active', active);
+      btn.classList.toggle('pos', isPosBtn && active);
+      btn.classList.toggle('neg', !isPosBtn && active);
+    });
+
+    // Score badge (only when semantic results active)
+    const wrap = card.querySelector('.image-wrapper');
+    if (!wrap) return;
+    const old = wrap.querySelector('.semantic-score-badge');
+    if (SemState.activeResults && SemState.scoresByFilename.has(fn)) {
+      const pct = Math.round(SemState.scoresByFilename.get(fn) * 100);
+      if (old) {
+        old.textContent = `${pct}%`;
+      } else {
+        const badge = document.createElement('span');
+        badge.className = 'semantic-score-badge';
+        badge.textContent = `${pct}%`;
+        wrap.appendChild(badge);
+      }
+    } else if (old) {
+      old.remove();
+    }
+  }
+
+  function restyleAllCards() {
+    document.querySelectorAll('#image-grid .image-card').forEach(restyleCard);
+  }
+
+  // ---- Toggle helpers -------------------------------------------------------
+
+  function togglePositive(fn) {
+    if (!fn) return;
+    const i = SemState.positives.indexOf(fn);
+    if (i >= 0) {
+      SemState.positives.splice(i, 1);
+    } else {
+      const j = SemState.negatives.indexOf(fn);
+      if (j >= 0) SemState.negatives.splice(j, 1);
+      SemState.positives.push(fn);
+    }
+    onContextChange();
+  }
+
+  function toggleNegative(fn) {
+    if (!fn) return;
+    const i = SemState.negatives.indexOf(fn);
+    if (i >= 0) {
+      SemState.negatives.splice(i, 1);
+    } else {
+      const j = SemState.positives.indexOf(fn);
+      if (j >= 0) SemState.positives.splice(j, 1);
+      SemState.negatives.push(fn);
+    }
+    onContextChange();
+  }
+
+  function clearContext() {
+    SemState.positives = [];
+    SemState.negatives = [];
+    onContextChange();
+  }
+
+  function onContextChange() {
+    renderContextStrip();
+    restyleAllCards();
+  }
+
+  // ---- Mode toggle ----------------------------------------------------------
+
+  function setSemanticMode(on) {
+    SemState.enabled = !!on;
+    document.body.classList.toggle('semantic-mode', SemState.enabled);
+    const btn = qs('#semantic-toggle');
+    if (btn) btn.setAttribute('aria-pressed', SemState.enabled ? 'true' : 'false');
+    const input = qs('#search-input');
+    if (input) {
+      if (SemState.enabled) {
+        input.dataset.normalPlaceholder = input.placeholder || '';
+        input.placeholder = 'Semantic search — press Enter to search by meaning';
+      } else if (input.dataset.normalPlaceholder !== undefined) {
+        input.placeholder = input.dataset.normalPlaceholder;
+      }
+    }
+    if (!SemState.enabled) {
+      clearSemanticResults();
+      clearContext();
+    } else {
+      decorateAllCards();
+      renderContextStrip();
+    }
+  }
+
+  // ---- Searching ------------------------------------------------------------
+
+  async function runSemantic() {
+    const q = (qs('#search-input')?.value || '').trim();
+    const hasCtx = SemState.positives.length || SemState.negatives.length;
+    if (!q && !hasCtx) {
+      setStatus('Type a query or 👍/👎 some images first.', 'error');
+      return;
+    }
+    if (hasCtx) return runDiscover(q);
+    return runSearch(q);
+  }
+
+  async function runSearch(q) {
+    setStatus('Searching…');
+    try {
+      const url = `/api/ha/search?q=${encodeURIComponent(q)}&top_k=64`;
+      const r = await fetch(url);
+      const data = await r.json();
+      if (!r.ok || data.error) {
+        setStatus('Error: ' + (data.error || r.statusText), 'error');
+        return;
+      }
+      applyResults(data.results || [], `${(data.results || []).length} semantic results for "${q}"`);
+    } catch (e) {
+      setStatus('Search failed: ' + e.message, 'error');
+    }
+  }
+
+  async function runDiscover(q) {
+    const validity = validateForSearch(q);
+    if (!validity.ok) {
+      setStatus(validity.reason, 'error');
+      return;
+    }
+    setStatus('Discovering…');
+    try {
+      const r = await fetch('/api/ha/discover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text_query: q || null,
+          positives: [...SemState.positives],
+          negatives: [...SemState.negatives],
+          top_k: 64,
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok || data.error) {
+        setStatus('Error: ' + (data.error || r.statusText), 'error');
+        return;
+      }
+      const targetDesc = q ? `target: "${q}"` : `target: ${SemState.positives[0] || '?'}`;
+      const summary = `${(data.results || []).length} results — ${targetDesc} • ${SemState.positives.length}👍 • ${SemState.negatives.length}👎`;
+      applyResults(data.results || [], summary);
+    } catch (e) {
+      setStatus('Discover failed: ' + e.message, 'error');
+    }
+  }
+
+  function applyResults(results, summaryMsg) {
+    SemState.activeResults = results.map(r => r.filename).filter(Boolean);
+    SemState.scoresByFilename = new Map(results.map(r => [r.filename, r.score || 0]));
+
+    // Hand the gallery a substring filter that hits only our ranked filenames,
+    // then re-render. The substring filter is permissive enough; we sort by
+    // querying our ordered list afterwards.
+    renderSemanticGallery();
+    setStatus(summaryMsg);
+  }
+
+  function clearSemanticResults() {
+    SemState.activeResults = null;
+    SemState.scoresByFilename.clear();
+    setStatus('');
+    if (typeof renderGallery === 'function') {
+      try { renderGallery(); } catch (_) { /* ignore */ }
+    }
+  }
+
+  function renderSemanticGallery() {
+    const grid = document.getElementById('image-grid');
+    if (!grid) return;
+    // allImages is declared with `let` at the top of app.js — same script
+    // scope, so we can reference it directly without going through window.
+    const lib = (typeof allImages === 'object' && allImages) ? allImages : {};
+    const ordered = SemState.activeResults
+      .map(fn => [fn, lib[fn]])
+      .filter(([, data]) => !!data);
+
+    if (ordered.length === 0) {
+      grid.innerHTML = '<div class="empty-state">No semantic results matched library images.</div>';
+      return;
+    }
+
+    // We render directly to the grid here rather than going through
+    // renderGallery(), so the semantic ranking is preserved. Existing tag
+    // filters / sort dropdowns are bypassed while semantic results are shown.
+    grid.innerHTML = ordered.map(([fn, data], idx) => buildSemCardHtml(fn, data, idx)).join('');
+    decorateAllCards();
+    restyleAllCards();
+    attachSemCardClickHandlers(grid);
+  }
+
+  function buildSemCardHtml(filename, data, index) {
+    const tags = (data?.tags || []).map(t => `<span class="tag">${escHtml(t)}</span>`).join('');
+    const displayName = (typeof getDisplayName === 'function')
+      ? getDisplayName(filename)
+      : filename;
+    const cb = (typeof thumbnailCacheBusters === 'object' && thumbnailCacheBusters && thumbnailCacheBusters[filename])
+      ? `?v=${thumbnailCacheBusters[filename]}` : '';
+    return `
+      <div class="image-card" data-filename="${escHtml(filename)}" data-index="${index}">
+        <div class="image-wrapper">
+          <img src="thumbs/thumb_${escHtml(filename)}${cb}"
+               onerror="this.src='library/${escHtml(filename)}'"
+               alt="${escHtml(displayName)}" />
+        </div>
+        <div class="image-info">
+          <div class="image-filename"><span class="image-filename-text">${escHtml(displayName)}</span></div>
+          <div class="image-tags">${tags}</div>
+        </div>
+      </div>`;
+  }
+
+  function attachSemCardClickHandlers(grid) {
+    // Mirror the existing per-card click → openImageModal so the rest of the
+    // app keeps working when a result is clicked.
+    grid.querySelectorAll('.image-card').forEach(card => {
+      if (card.dataset.semClickAttached) return;
+      card.dataset.semClickAttached = '1';
+      card.addEventListener('click', e => {
+        if (e.target.closest('.semantic-vote-btn')) return;  // handled below
+        if (e.shiftKey || e.metaKey || e.ctrlKey) return;     // selection ops handled by app
+        if (typeof openImageModal === 'function') {
+          openImageModal(card.dataset.filename);
+        }
+      });
+    });
+  }
+
+  // ---- Wiring (DOM ready) ---------------------------------------------------
+
+  function init() {
+    // Toggle button
+    const toggle = qs('#semantic-toggle');
+    if (toggle) {
+      toggle.addEventListener('click', () => setSemanticMode(!SemState.enabled));
+    }
+
+    // Search input: Enter to run semantic when enabled. Re-render context strip on input.
+    const input = qs('#search-input');
+    if (input) {
+      input.addEventListener('keydown', e => {
+        if (e.key !== 'Enter') return;
+        if (!SemState.enabled) return;          // normal search input behavior wins
+        e.preventDefault();
+        runSemantic();
+      });
+      input.addEventListener('input', () => {
+        if (SemState.enabled) renderContextStrip();
+      });
+    }
+
+    // Status strip: clear-results button
+    const status = qs('#semantic-status');
+    if (status) {
+      status.addEventListener('click', e => {
+        if (e.target.closest('[data-action="clear-results"]')) clearSemanticResults();
+      });
+    }
+
+    // Context strip: chip removal + clear / run-discover
+    const strip = qs('#semantic-context-strip');
+    if (strip) {
+      strip.addEventListener('click', e => {
+        const action = e.target.dataset?.action;
+        if (action === 'clear-ctx') { clearContext(); return; }
+        if (action === 'run-discover') { runSemantic(); return; }
+        const x = e.target.closest('.chip-x');
+        if (!x) return;
+        const fn = x.dataset.filename;
+        const list = x.dataset.remove === 'pos' ? SemState.positives : SemState.negatives;
+        const i = list.indexOf(fn);
+        if (i >= 0) list.splice(i, 1);
+        onContextChange();
+      });
+    }
+
+    // Per-card vote buttons + right-click → negative.
+    // Delegated on the grid because cards are constantly re-rendered.
+    const grid = document.getElementById('image-grid');
+    if (grid) {
+      grid.addEventListener('click', e => {
+        if (!SemState.enabled) return;
+        const vbtn = e.target.closest('.semantic-vote-btn');
+        if (!vbtn) return;
+        e.stopPropagation();
+        const fn = vbtn.dataset.filename;
+        if (vbtn.dataset.vote === 'pos') togglePositive(fn);
+        else toggleNegative(fn);
+      }, true);
+      grid.addEventListener('contextmenu', e => {
+        if (!SemState.enabled) return;
+        const card = e.target.closest('.image-card');
+        if (!card) return;
+        e.preventDefault();
+        toggleNegative(card.dataset.filename);
+      });
+    }
+
+    // Watch for newly rendered cards and decorate them so vote buttons + active
+    // state appear without modifying renderGalleryChunk.
+    const target = document.getElementById('image-grid');
+    if (target && typeof MutationObserver !== 'undefined') {
+      const mo = new MutationObserver(() => {
+        if (!SemState.enabled) return;
+        decorateAllCards();
+        restyleAllCards();
+      });
+      mo.observe(target, { childList: true });
+    }
+  }
+
+  // Expose a small surface for debugging; nothing else depends on it.
+  window.__semanticSearch = {
+    state: SemState,
+    setEnabled: setSemanticMode,
+    runSemantic,
+    clearContext,
+    clearResults: clearSemanticResults,
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
 

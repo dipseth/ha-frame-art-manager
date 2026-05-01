@@ -834,4 +834,53 @@ router.post('/set-recency-windows', requireHA, async (req, res) => {
   }
 });
 
+// GET /api/ha/search?q=...&top_k=... - Qdrant semantic text search
+router.get('/search', requireHA, async (req, res) => {
+  const q = (req.query.q || '').toString().trim();
+  if (!q) {
+    return res.status(400).json({ error: "Missing query parameter 'q'" });
+  }
+  const topK = Math.max(1, Math.min(parseInt(req.query.top_k, 10) || 32, 200));
+
+  if (!SUPERVISOR_TOKEN && process.env.NODE_ENV === 'development') {
+    return res.json({ query: q, results: [] });
+  }
+
+  try {
+    const url = `/frame_art_shuffler/search?q=${encodeURIComponent(q)}&top_k=${topK}`;
+    const result = await haRequest('GET', url);
+    res.json(result);
+  } catch (error) {
+    console.error('Semantic search error:', error.message);
+    res.status(error.response?.status || 500).json({
+      error: error.response?.data?.error || error.message,
+    });
+  }
+});
+
+// POST /api/ha/discover - Qdrant Discover (image-based / context-shaped search)
+router.post('/discover', requireHA, async (req, res) => {
+  const { text_query, positives, negatives, top_k } = req.body || {};
+  const payload = {
+    text_query: text_query || null,
+    positives: Array.isArray(positives) ? positives : [],
+    negatives: Array.isArray(negatives) ? negatives : [],
+    top_k: Math.max(1, Math.min(parseInt(top_k, 10) || 32, 200)),
+  };
+
+  if (!SUPERVISOR_TOKEN && process.env.NODE_ENV === 'development') {
+    return res.json({ results: [] });
+  }
+
+  try {
+    const result = await haRequest('POST', '/frame_art_shuffler/discover', payload);
+    res.json(result);
+  } catch (error) {
+    console.error('Discover error:', error.message);
+    res.status(error.response?.status || 500).json({
+      error: error.response?.data?.error || error.message,
+    });
+  }
+});
+
 module.exports = router;

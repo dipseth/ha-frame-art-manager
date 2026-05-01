@@ -21,6 +21,9 @@
           <div class="controls" role="toolbar" aria-label="Gallery controls">
             <div class="control-item control-search">
               <input type="search" id="search-input" placeholder="Search images" aria-label="Search images" autocomplete="off" />
+              <button type="button" id="semantic-toggle" class="semantic-toggle" title="Toggle semantic search (filter by meaning, with 👍/👎 discovery)" aria-pressed="false">
+                <span class="semantic-toggle-icon">✨</span>
+              </button>
             </div>
             <div class="control-item control-tv-status" id="tv-status-container">
               <!-- TV status dots rendered by JS -->
@@ -79,6 +82,9 @@
           <button id="clear-selection-btn" class="btn-secondary"><span class="desktop-text">Deselect (<span id="selected-count">0</span>)</span><span class="mobile-text">Deselect<br>(<span id="selected-count-mobile">0</span>)</span></button>
         </div>
       </div>
+
+      <div id="semantic-status" class="semantic-status"></div>
+      <div id="semantic-context-strip" class="semantic-context-strip"></div>
 
       <div id="image-grid" class="image-grid">
         <!-- Images will be loaded here -->
