@@ -2009,6 +2009,7 @@ async function loadGallery() {
     const response = await fetch(`${API_BASE}/images`);
     allImages = await response.json();
     galleryHasLoadedAtLeastOnce = true;
+    refreshSearchSuggestions();
 
     // Also load tags for filter dropdown
     await loadTagsForFilter();
@@ -2122,19 +2123,75 @@ function clearSelection() {
   updateGallerySelectionVisual();
 }
 
+// Normalize a string for fuzzy comparison: lowercase, drop punctuation that
+// segments filenames (dashes, underscores, dots), collapse whitespace.
+function normalizeForSearch(s) {
+  return String(s ?? '')
+    .toLowerCase()
+    .replace(/[._\-/\\]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Build a single normalized search haystack from an image's metadata.
+// Includes filename stem + tags + matte + filter so the search matches across
+// every user-meaningful field, not just the filename.
+function buildSearchHaystack(filename, data) {
+  const parts = [filename];
+  if (data) {
+    if (Array.isArray(data.tags)) parts.push(data.tags.join(' '));
+    if (data.matte && data.matte !== 'none') parts.push(String(data.matte));
+    if (data.filter && data.filter !== 'none') parts.push(String(data.filter));
+  }
+  return normalizeForSearch(parts.join(' '));
+}
+
+// Tokenize the query on whitespace. Each token must appear somewhere in the
+// haystack (AND across tokens) for the image to match.
+function fuzzyMatchesQuery(filename, data, rawQuery) {
+  const q = normalizeForSearch(rawQuery);
+  if (!q) return true;
+  const haystack = buildSearchHaystack(filename, data);
+  const tokens = q.split(' ').filter(Boolean);
+  return tokens.every(tok => haystack.includes(tok));
+}
+
+// Populate the <datalist> attached to the search input with native autocomplete
+// suggestions. Includes every unique tag, matte, filter, and a small set of
+// useful filename stems. The browser handles the dropdown UI for free.
+function refreshSearchSuggestions() {
+  const list = document.getElementById('search-suggestions');
+  if (!list || typeof allImages !== 'object') return;
+  const suggestions = new Set();
+  for (const [filename, data] of Object.entries(allImages)) {
+    if (data && Array.isArray(data.tags)) {
+      data.tags.forEach(t => t && suggestions.add(String(t)));
+    }
+    if (data?.matte && data.matte !== 'none') suggestions.add(String(data.matte));
+    if (data?.filter && data.filter !== 'none') suggestions.add(String(data.filter));
+    // Filename stem (no extension) — useful when the user remembers part of a name
+    const stem = String(filename).replace(/\.[^.]+$/, '');
+    if (stem) suggestions.add(stem);
+  }
+  const sorted = Array.from(suggestions).sort((a, b) => a.localeCompare(b));
+  list.innerHTML = sorted
+    .map(v => `<option value="${String(v).replace(/"/g, '&quot;')}"></option>`)
+    .join('');
+}
+
 function selectAllImages() {
   // Get all currently visible/filtered images
   const searchInput = document.getElementById('search-input');
-  const searchTerm = (searchInput?.value || '').toLowerCase();
+  const searchTerm = searchInput?.value || '';
   const includedTags = getIncludedTags();
   const excludedTags = getExcludedTags();
 
   let filteredImages = Object.entries(allImages);
 
   // Apply same filters as renderGallery
-  if (searchTerm) {
-    filteredImages = filteredImages.filter(([filename]) => 
-      filename.toLowerCase().includes(searchTerm)
+  if (searchTerm.trim()) {
+    filteredImages = filteredImages.filter(([filename, data]) =>
+      fuzzyMatchesQuery(filename, data, searchTerm)
     );
   }
 
@@ -3351,7 +3408,7 @@ function renderGallery(filter = '') {
   updateSimilarThresholdBar();
 
   const searchInput = document.getElementById('search-input');
-  const searchTerm = (searchInput?.value || '').toLowerCase();
+  const searchTerm = searchInput?.value || '';
   const sortOrderSelect = document.getElementById('sort-order');
   const sortOrder = sortOrderSelect ? sortOrderSelect.value : initialSortOrderPreference;
 
@@ -3384,10 +3441,10 @@ function renderGallery(filter = '') {
 
   let filteredImages = Object.entries(allImages);
 
-  // Filter by search term
-  if (searchTerm) {
-    filteredImages = filteredImages.filter(([filename]) => 
-      filename.toLowerCase().includes(searchTerm)
+  // Filter by search term — fuzzy across filename + tags + matte + filter
+  if (searchTerm.trim()) {
+    filteredImages = filteredImages.filter(([filename, data]) =>
+      fuzzyMatchesQuery(filename, data, searchTerm)
     );
   }
 
@@ -9135,6 +9192,7 @@ async function loadAnalytics(selectedImage = null) {
       const galleryResponse = await fetch(`${API_BASE}/images`);
       allImages = await galleryResponse.json();
       galleryHasLoadedAtLeastOnce = true;
+      refreshSearchSuggestions();
     }
     
     const response = await fetch(`${API_BASE}/analytics/summary`);
